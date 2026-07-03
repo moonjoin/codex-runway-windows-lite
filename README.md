@@ -46,6 +46,18 @@ python run.py --self-check
 python -m pytest tests -q
 ```
 
+## 打包 EXE
+
+```powershell
+.\build-exe.ps1
+```
+
+打包产物：
+
+```text
+dist\CodexRunwayLite.exe
+```
+
 ## 许可证
 
 本项目按 AGPL-3.0 发布。原始项目许可证同为 AGPL-3.0。
