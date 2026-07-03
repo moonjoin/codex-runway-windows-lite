@@ -20,6 +20,9 @@
 - 不等同于真实账单，界面里的成本是“API 等价成本估算”。
 - 目前还没有托盘、安装包、自动更新。
 
+<img width="518" height="1278" alt="screenshot-20260703-162836" src="https://github.com/user-attachments/assets/985db451-e089-4c31-bc64-57e562810056" />
+
+
 ## 运行
 
 需要 Windows 和 Python 3.11+。运行界面：
