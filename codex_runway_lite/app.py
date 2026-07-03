@@ -3,11 +3,19 @@ from __future__ import annotations
 import json
 import threading
 import tkinter as tk
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Any
+
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+except Exception:  # noqa: BLE001 - tray support is optional for source runs.
+    pystray = None
+    Image = None
+    ImageDraw = None
 
 from .core import (
     NamedRateWindow,
@@ -42,21 +50,94 @@ COLORS = {
 }
 
 
+DEFAULT_AUTO_REFRESH_MINUTES = 15
+AUTO_REFRESH_CHOICES = (0, 5, 10, 15, 30, 60)
+AUTO_REFRESH_LABELS = {
+    0: "关闭",
+    5: "5分钟",
+    10: "10分钟",
+    15: "15分钟",
+    30: "30分钟",
+    60: "60分钟",
+}
+AUTO_REFRESH_BY_LABEL = {label: minutes for minutes, label in AUTO_REFRESH_LABELS.items()}
+
+
+@dataclass(frozen=True)
+class AppSettings:
+    auto_refresh_minutes: int = DEFAULT_AUTO_REFRESH_MINUTES
+    close_to_tray: bool = True
+
+
+def default_settings_path() -> Path:
+    return Path.home() / ".codex-runway" / "settings-lite.json"
+
+
+def load_app_settings(path: Path | None = None) -> AppSettings:
+    settings_path = path or default_settings_path()
+    try:
+        data = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return AppSettings()
+    return AppSettings(
+        auto_refresh_minutes=_normalize_auto_refresh_minutes(data.get("auto_refresh_minutes")),
+        close_to_tray=bool(data.get("close_to_tray", True)),
+    )
+
+
+def save_app_settings(path: Path | None, settings: AppSettings) -> None:
+    settings_path = path or default_settings_path()
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(
+        json.dumps(asdict(settings), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _normalize_auto_refresh_minutes(value: Any) -> int:
+    try:
+        minutes = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_AUTO_REFRESH_MINUTES
+    if minutes not in AUTO_REFRESH_CHOICES:
+        return DEFAULT_AUTO_REFRESH_MINUTES
+    return minutes
+
+
 class CodexRunwayLiteApp:
-    def __init__(self, auto_refresh: bool = True) -> None:
+    def __init__(
+        self,
+        auto_refresh: bool = True,
+        tray_enabled: bool = True,
+        settings_path: Path | None = None,
+    ) -> None:
         self.root = tk.Tk()
         self.root.title("Codex Runway")
         self.root.geometry("540x720")
         self.root.minsize(480, 520)
         self.root.configure(bg=COLORS["page"])
         self.root.option_add("*Font", "{Segoe UI} 9")
+        self.settings_path = settings_path or default_settings_path()
+        self.settings = load_app_settings(self.settings_path)
+        self.tray_enabled = tray_enabled
+        self.tray_icon: Any | None = None
+        self.tray_running = False
+        self.tray_thread: threading.Thread | None = None
+        self.is_quitting = False
+        self.refresh_in_progress = False
+        self.auto_refresh_after_id: str | None = None
+        self.hide_notice_shown = False
         self.snapshot: dict[str, Any] | None = None
         self.recent_expanded = False
         self.refresh_button: tk.Button | None = None
         self.status_var = tk.StringVar(value="正在启动...")
+        self.auto_refresh_var = tk.StringVar(value=self._auto_refresh_label(self.settings.auto_refresh_minutes))
+        self.tray_status_var = tk.StringVar(value="托盘：准备中")
         self._set_icon()
         self._configure_theme()
         self._build()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._start_tray()
         if auto_refresh:
             self.refresh()
 
@@ -124,6 +205,22 @@ class CodexRunwayLiteApp:
                 ("!disabled", COLORS["page"]),
             ],
         )
+        self.ui_style.configure(
+            "Runway.TCombobox",
+            fieldbackground=COLORS["panel_soft"],
+            background=COLORS["button"],
+            foreground=COLORS["text"],
+            arrowcolor=COLORS["muted"],
+            bordercolor=COLORS["line"],
+            lightcolor=COLORS["line"],
+            darkcolor=COLORS["line"],
+            relief="flat",
+        )
+        self.ui_style.map(
+            "Runway.TCombobox",
+            fieldbackground=[("readonly", COLORS["panel_soft"])],
+            foreground=[("readonly", COLORS["text"])],
+        )
 
     def _build(self) -> None:
         self.shell = tk.Frame(self.root, bg=COLORS["page"], padx=16, pady=14)
@@ -136,6 +233,8 @@ class CodexRunwayLiteApp:
         self.reset_body = self._section(self.content, "重置次数", "可用 reset credits 和到期风险")
         self.cost_body = self._section(self.content, "API 等价成本", "按本机会话 token 估算，不是实际账单")
         self.sessions_body = self._section(self.content, "最近会话", "默认折叠，展开后显示完整明细")
+        self.settings_body = self._section(self.content, "设置", "托盘常驻和自动刷新")
+        self._render_settings()
 
         self.status = tk.Label(
             self.shell,
@@ -234,17 +333,19 @@ class CodexRunwayLiteApp:
         body.pack(fill="x")
         return body
 
-    def refresh(self) -> None:
+    def refresh(self, show_errors: bool = True) -> None:
+        if self.refresh_in_progress:
+            return
         if self.snapshot is None:
             self._show_loading_placeholders()
         self._set_busy(True, "正在刷新配额和本机会话...")
-        threading.Thread(target=self._refresh_worker, daemon=True).start()
+        threading.Thread(target=self._refresh_worker, args=(show_errors,), daemon=True).start()
 
-    def _refresh_worker(self) -> None:
+    def _refresh_worker(self, show_errors: bool) -> None:
         try:
             snapshot = build_status_snapshot(recent_limit=20)
         except Exception as exc:  # noqa: BLE001 - UI should show user-facing failures.
-            self.root.after(0, lambda: self._show_error(exc))
+            self.root.after(0, lambda: self._show_error(exc, show_dialog=show_errors))
             return
         self.root.after(0, lambda: self._render(snapshot))
 
@@ -255,7 +356,9 @@ class CodexRunwayLiteApp:
         self._render_resets(snapshot["reset_credits"])
         self._render_cost(snapshot["usage_7d"])
         self._render_sessions(snapshot["recent_sessions"])
+        self._update_tray_title()
         self._set_busy(False, f"已刷新：{datetime.now().strftime('%H:%M:%S')}")
+        self._schedule_auto_refresh()
         self.root.after_idle(lambda: self.content_canvas.yview_moveto(0))
 
     def _show_loading_placeholders(self) -> None:
@@ -339,6 +442,64 @@ class CodexRunwayLiteApp:
         for session in sessions:
             self._session_row(self.sessions_body, session)
 
+    def _render_settings(self) -> None:
+        self._clear(self.settings_body)
+        row = tk.Frame(self.settings_body, bg=COLORS["panel"])
+        row.pack(fill="x", pady=(0, 6))
+        tk.Label(row, text="自动刷新", bg=COLORS["panel"], fg=COLORS["muted"], anchor="w").pack(side="left")
+        combo = ttk.Combobox(
+            row,
+            textvariable=self.auto_refresh_var,
+            values=[AUTO_REFRESH_LABELS[minutes] for minutes in AUTO_REFRESH_CHOICES],
+            state="readonly",
+            width=10,
+            style="Runway.TCombobox",
+        )
+        combo.pack(side="right")
+        combo.bind("<<ComboboxSelected>>", self._on_auto_refresh_changed)
+        tray_text = "关闭窗口后继续在托盘运行" if self.tray_enabled else "托盘已关闭"
+        self._muted(self.settings_body, tray_text)
+        tk.Label(
+            self.settings_body,
+            textvariable=self.tray_status_var,
+            bg=COLORS["panel"],
+            fg=COLORS["muted"],
+            anchor="w",
+            justify="left",
+        ).pack(fill="x", pady=(2, 0))
+
+    def _on_auto_refresh_changed(self, _event: tk.Event | None) -> None:
+        minutes = AUTO_REFRESH_BY_LABEL.get(self.auto_refresh_var.get(), DEFAULT_AUTO_REFRESH_MINUTES)
+        self.settings = AppSettings(auto_refresh_minutes=minutes, close_to_tray=self.settings.close_to_tray)
+        save_app_settings(self.settings_path, self.settings)
+        self._schedule_auto_refresh()
+        label = self._auto_refresh_label(minutes)
+        self.status_var.set(f"自动刷新已设置为：{label}")
+
+    def _schedule_auto_refresh(self) -> None:
+        self._cancel_auto_refresh()
+        if self.is_quitting:
+            return
+        minutes = self.settings.auto_refresh_minutes
+        if minutes <= 0:
+            return
+        self.auto_refresh_after_id = self.root.after(minutes * 60 * 1000, self._auto_refresh_tick)
+
+    def _cancel_auto_refresh(self) -> None:
+        if not self.auto_refresh_after_id:
+            return
+        try:
+            self.root.after_cancel(self.auto_refresh_after_id)
+        except tk.TclError:
+            pass
+        self.auto_refresh_after_id = None
+
+    def _auto_refresh_tick(self) -> None:
+        self.auto_refresh_after_id = None
+        if self.is_quitting:
+            return
+        self.refresh(show_errors=False)
+
     def toggle_recent_sessions(self) -> None:
         self.recent_expanded = not self.recent_expanded
         if self.snapshot:
@@ -406,6 +567,112 @@ class CodexRunwayLiteApp:
                 wraplength=420,
             ).pack(fill="x", pady=(3, 0))
 
+    def _start_tray(self) -> None:
+        if not self.tray_enabled:
+            self.tray_status_var.set("托盘未启用")
+            return
+        if pystray is None or Image is None or ImageDraw is None:
+            self.tray_status_var.set("托盘不可用：缺少 pystray / Pillow")
+            return
+        try:
+            self.tray_icon = pystray.Icon(
+                "CodexRunwayLite",
+                self._create_tray_image(),
+                self._tray_title(),
+                pystray.Menu(
+                    pystray.MenuItem("显示面板", self._tray_show, default=True),
+                    pystray.MenuItem("立即刷新", self._tray_refresh),
+                    pystray.MenuItem("打开 .codex", self._tray_open_codex),
+                    pystray.Menu.SEPARATOR,
+                    pystray.MenuItem("退出", self._tray_quit),
+                ),
+            )
+            self.tray_thread = threading.Thread(target=self._run_tray_icon, daemon=True)
+            self.tray_thread.start()
+            self.tray_running = True
+            self.tray_status_var.set("托盘已启用：关闭窗口后仍会后台刷新")
+        except Exception as exc:  # noqa: BLE001 - tray should not block the main UI.
+            self.tray_running = False
+            self.tray_status_var.set(f"托盘启动失败：{exc}")
+
+    def _run_tray_icon(self) -> None:
+        if self.tray_icon is None:
+            return
+        try:
+            self.tray_icon.run()
+        except Exception:
+            self.tray_running = False
+
+    def _create_tray_image(self) -> Any:
+        image = Image.new("RGBA", (64, 64), (*self._hex_to_rgb(COLORS["page"]), 255))
+        draw = ImageDraw.Draw(image)
+        draw.rounded_rectangle((8, 8, 56, 56), radius=12, fill=COLORS["panel"], outline=COLORS["line"], width=2)
+        draw.rectangle((18, 20, 46, 26), fill=COLORS["green"])
+        draw.rectangle((18, 32, 38, 38), fill=COLORS["blue"])
+        draw.rectangle((18, 44, 30, 50), fill=COLORS["orange"])
+        return image
+
+    def _tray_title(self) -> str:
+        if not self.snapshot:
+            return "Codex Runway\n正在加载"
+        quota: QuotaSnapshot = self.snapshot["quota"]
+        resets: ResetCreditsSnapshot = self.snapshot["reset_credits"]
+        remaining = max(0, 100 - quota.primary.used_percent)
+        return f"Codex Runway\n5小时剩余 {remaining}%\n重置次数 {resets.available_count}/{resets.total_count}"
+
+    def _update_tray_title(self) -> None:
+        if not self.tray_icon:
+            return
+        try:
+            self.tray_icon.title = self._tray_title()
+        except Exception:
+            pass
+
+    def _tray_show(self, _icon: Any = None, _item: Any = None) -> None:
+        self.root.after(0, self.show_window)
+
+    def _tray_refresh(self, _icon: Any = None, _item: Any = None) -> None:
+        self.root.after(0, self.refresh)
+
+    def _tray_open_codex(self, _icon: Any = None, _item: Any = None) -> None:
+        self.root.after(0, self.open_codex_folder)
+
+    def _tray_quit(self, _icon: Any = None, _item: Any = None) -> None:
+        self.root.after(0, self.quit_app)
+
+    def show_window(self) -> None:
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def hide_window(self) -> None:
+        self.root.withdraw()
+        if self.tray_icon and not self.hide_notice_shown:
+            try:
+                self.tray_icon.notify("Codex Runway 正在托盘继续运行", "Codex Runway")
+            except Exception:
+                pass
+            self.hide_notice_shown = True
+
+    def _on_close(self) -> None:
+        if self.settings.close_to_tray and self.tray_running and not self.is_quitting:
+            self.hide_window()
+            return
+        self.quit_app()
+
+    def quit_app(self) -> None:
+        self.is_quitting = True
+        self._cancel_auto_refresh()
+        if self.tray_icon:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
     def export_status(self) -> None:
         if not self.snapshot:
             messagebox.showinfo("Codex Runway", "先刷新一次，再导出。")
@@ -425,11 +692,14 @@ class CodexRunwayLiteApp:
         except OSError as exc:
             messagebox.showerror("打开 .codex 失败", str(exc))
 
-    def _show_error(self, exc: Exception) -> None:
+    def _show_error(self, exc: Exception, show_dialog: bool = True) -> None:
         self._set_busy(False, f"刷新失败：{exc}")
-        messagebox.showerror("刷新失败", str(exc))
+        self._schedule_auto_refresh()
+        if show_dialog:
+            messagebox.showerror("刷新失败", str(exc))
 
     def _set_busy(self, busy: bool, text: str) -> None:
+        self.refresh_in_progress = busy
         self.status_var.set(text)
         self.root.config(cursor="watch" if busy else "")
         if self.refresh_button:
@@ -645,6 +915,13 @@ class CodexRunwayLiteApp:
         if value >= 1_000:
             return f"{value / 1_000:.2f}K"
         return str(value)
+
+    def _auto_refresh_label(self, minutes: int) -> str:
+        return AUTO_REFRESH_LABELS.get(minutes, AUTO_REFRESH_LABELS[DEFAULT_AUTO_REFRESH_MINUTES])
+
+    def _hex_to_rgb(self, color: str) -> tuple[int, int, int]:
+        value = color.lstrip("#")
+        return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
 
 
 def _json_default(value: Any) -> Any:

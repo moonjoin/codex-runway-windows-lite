@@ -12,13 +12,15 @@
 - 按近 7 天本机会话估算 API 等价成本、tokens、轮数和模型分布。
 - 最近会话默认折叠，展开后显示完整标题、项目路径、tokens 和估算成本。
 - 支持导出脱敏快照到 `%USERPROFILE%\.codex-runway\status-lite.json`。
+- 支持系统托盘：关闭窗口后继续后台运行，可从托盘显示、刷新、打开 `.codex` 或退出。
+- 支持自动刷新频率设置：关闭、5 分钟、10 分钟、15 分钟、30 分钟、60 分钟。
 
 ## 不做什么
 
 - 不修改 `.codex/auth.json`。
 - 不上传本机会话内容。
 - 不等同于真实账单，界面里的成本是“API 等价成本估算”。
-- 目前还没有托盘、安装包、自动更新。
+- 目前还没有安装包和自动更新。
 
 <img width="518" height="1278" alt="screenshot-20260703-162836" src="https://github.com/user-attachments/assets/985db451-e089-4c31-bc64-57e562810056" />
 
@@ -28,6 +30,7 @@
 需要 Windows 和 Python 3.11+。运行界面：
 
 ```powershell
+python -m pip install -r requirements.txt
 python run.py
 ```
 
@@ -60,6 +63,8 @@ python -m pytest tests -q
 ```text
 dist\CodexRunwayLite.exe
 ```
+
+EXE 是单文件版本，分享给别人时只需要发这个文件。它会读取对方自己电脑上的 `%USERPROFILE%\.codex` 数据。
 
 ## 许可证
 
